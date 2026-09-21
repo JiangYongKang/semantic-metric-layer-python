@@ -34,8 +34,8 @@ _QUANTUM = Decimal("1E-10")
 def _safe_div(numerator: Decimal | int | None, denominator: Decimal | int | None):
     """固定除法语义：分母为 None 或 0 -> None；否则量化到 10 位小数。
 
-    零结果规范化为固定写法 ``0.0000000000``（避免 ``0E-10`` 之类
-    数值相同但文本不可复现的差异）。
+    数值层只产出确定的 Decimal；对外文本形态由序列化层统一
+    （HTTP 用 ``format(value, 'f')``，零值固定显示为 0.0000000000）。
     """
     if denominator is None or denominator == 0:
         return None
@@ -43,8 +43,7 @@ def _safe_div(numerator: Decimal | int | None, denominator: Decimal | int | None
         ctx.prec = 65
         ctx.rounding = ROUND_HALF_UP
         raw = Decimal(numerator) / Decimal(denominator)
-    quantized = raw.quantize(_QUANTUM, rounding=ROUND_HALF_UP)
-    return Decimal("0.0000000000") if quantized == 0 else quantized
+    return raw.quantize(_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
