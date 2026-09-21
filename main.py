@@ -1,8 +1,9 @@
-from fastapi import FastAPI
+"""FastAPI 入口：创建语义指标层服务。"""
 
-app = FastAPI()
+from __future__ import annotations
 
+from sml.registry import MetricLayer
+from sml.service import create_app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+layer = MetricLayer()
+app = create_app(layer)
