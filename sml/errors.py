@@ -155,3 +155,34 @@ class ConcurrencyError(SMLError):
     """并发冲突（如版本已过期）。"""
 
     code = "concurrency_conflict"
+
+
+class VersionLookupError(SMLError):
+    """历史版本回查相关错误的基类。
+
+    三种不可互相冒充、必须分别可程序化判别的情形：
+
+    - :class:`VersionNeverExistedError`：指定版本号从未发布过（大于当前版本）
+    - :class:`VersionEvictedError`：版本曾经发布成功，但已按保留上限淘汰
+    - :class:`VersionOutOfRangeError`：版本号超出可回查范围（非正版本号）
+    """
+
+    code = "version_lookup_error"
+
+
+class VersionNeverExistedError(VersionLookupError):
+    """指定版本号从未存在过（例如大于当前最新版本）。"""
+
+    code = "version_never_existed"
+
+
+class VersionEvictedError(VersionLookupError):
+    """版本曾成功发布，但已按保留容量规则淘汰，绝不能用当前版本顶替。"""
+
+    code = "version_evicted"
+
+
+class VersionOutOfRangeError(VersionLookupError):
+    """版本号超出可回查范围（非正整数等非法版本号）。"""
+
+    code = "version_out_of_range"

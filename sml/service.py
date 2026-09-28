@@ -8,6 +8,10 @@
 - ``PUT  /datasets/{name}/data``      更新数据内容（删列/改名会被拒绝）
 - ``POST /dimensions`` / ``/measures`` / ``/ratios`` / ``/relations`` 定义口径
 - ``POST /query``                     指标查询（返回行 + 列级血缘 + 版本）
+  请求体可带 ``at_version`` 回查历史版本；不存在/已淘汰/超范围分别返回
+  ``version_never_existed``(404) / ``version_evicted``(410) /
+  ``version_out_of_range``(400)
+- ``GET  /versions``                  当前版本、可回查历史版本清单与保留容量
 - ``GET  /cache/size`` ``POST /cache/clear``
 
 所有 :class:`~sml.errors.SMLError` 统一映射为 HTTP 4xx，响应体携带稳定
@@ -58,6 +62,9 @@ _STATUS_MAP = {
     "query_error": 400,
     "resource_limit": 429,
     "concurrency_conflict": 409,
+    "version_out_of_range": 400,
+    "version_never_existed": 404,
+    "version_evicted": 410,
 }
 
 
@@ -73,8 +80,13 @@ def _jsonable(value: object) -> object:
     return json.loads(json.dumps(value, cls=_JSONEncoder))
 
 
-def create_app(layer: MetricLayer | None = None) -> FastAPI:
-    layer = layer or MetricLayer()
+def create_app(layer: MetricLayer | None = None, *, max_history: int = 10) -> FastAPI:
+    """构造 HTTP 应用。
+
+    ``layer`` 缺省时新建；``max_history`` 仅在新建层时生效，控制最多保留的
+    历史版本数（当前版本永远保留，``0`` 表示不保留历史）。
+    """
+    layer = layer or MetricLayer(max_history=max_history)
     app = FastAPI(title="Local Semantic Metric Layer", version="0.1.0")
     app.state.layer = layer
 
@@ -104,6 +116,32 @@ def create_app(layer: MetricLayer | None = None) -> FastAPI:
             "metrics": layer.list_metrics(),
             "cache_size": layer.cache_size(),
         }
+
+    @app.get("/versions")
+    def versions() -> dict:
+        """当前版本 + 仍可回查的历史版本清单 + 保留容量。"""
+        history = layer.history_versions()
+        return {
+            "current_version": layer.model_version(),
+            "history_versions": list(history),
+            "oldest_available_version": history[0] if history else layer.model_version(),
+            "max_history": layer.history_limit(),
+        }
+
+    @app.post("/history/limit")
+    async def set_history_limit(request: Request) -> dict:
+        b = await request.json()
+        value = b.get("max_history")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "version_out_of_range",
+                                   "message": "max_history 必须是非负整数",
+                                   "details": {"max_history": value}}},
+            )
+        evicted = layer.set_history_limit(value)
+        return {"ok": True, "max_history": layer.history_limit(),
+                "evicted_versions": list(evicted)}
 
     @app.post("/datasets/{name}")
     async def register_dataset(name: str, request: Request) -> dict:
@@ -196,12 +234,19 @@ def create_app(layer: MetricLayer | None = None) -> FastAPI:
             max_bytes=int(bb.get("max_bytes", 256 * 1024 * 1024)),
             on_overflow=LimitAction(bb.get("on_overflow", "reject")),
         )
-        result = layer.query(q, budget=budget, use_cache=bool(b.get("use_cache", True)))
+        result = layer.query(
+            q,
+            budget=budget,
+            use_cache=bool(b.get("use_cache", True)),
+            at_version=b.get("at_version"),
+        )
         return {
             "columns": list(result.columns),
             "rows": [list(_jsonable_cell(v) for v in row) for row in result.rows],
             "lineage": result.lineage.to_dict(),
             "model_version": result.model_version,
+            "current_version": layer.model_version(),
+            "historical": b.get("at_version") is not None,
             "truncated": result.truncated,
             "resource_stats": result.resource_stats,
         }

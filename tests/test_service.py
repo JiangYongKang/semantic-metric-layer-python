@@ -149,6 +149,91 @@ class ServiceTest(LoggingTestCase):
         self.assertEqual(len(body["rows"]), 1)
         self.assertTrue(body["truncated"])
 
+    # ------------------------------------------------------------------
+    # 历史版本回查
+    # ------------------------------------------------------------------
+    def test_historical_query_http_returns_then_snapshot(self) -> None:
+        c = _client()
+        self._seed(c)
+        past = c.get("/versions").json()["current_version"]
+        # 更新 orders 数据（BJ 金额变化、行数变化）
+        r = c.put("/datasets/orders/data", json={"records": [
+            {"oid": 1, "cid": 10, "region": "east", "amount": "999.00", "qty": 2},
+            {"oid": 2, "cid": 10, "region": "east", "amount": "0.10", "qty": 1},
+            {"oid": 3, "cid": 20, "region": "west", "amount": "200.30", "qty": 3},
+            {"oid": 4, "cid": 20, "region": "west", "amount": "5.00", "qty": 1},
+        ]})
+        self.assertEqual(r.status_code, 200, r.text)
+        listing = c.get("/versions").json()
+        self.assertIn(past, listing["history_versions"])
+        self.assertEqual(listing["max_history"], 10)
+
+        cur = c.post("/query", json={"dimensions": ["city"], "measures": ["total", "cnt"]})
+        old = c.post("/query", json={
+            "dimensions": ["city"], "measures": ["total", "cnt"],
+            "at_version": past,
+        })
+        self.assertEqual(old.status_code, 200, old.text)
+        ob = old.json()
+        self.log_judgement("HTTP 回查历史版本",
+                           "model_version=历史版本、historical=true、BJ=100.10",
+                           f"mv={ob['model_version']}, cur={ob['current_version']}")
+        self.assertEqual(ob["model_version"], past)
+        self.assertEqual(ob["current_version"], listing["current_version"])
+        self.assertTrue(ob["historical"])
+        bj = next(row for row in ob["rows"] if row[0] == "BJ")
+        self.assertEqual(bj[1], "100.10")
+        # 当前版本 BJ 已是 999.10，明确不同
+        cur_bj = next(row for row in cur.json()["rows"] if row[0] == "BJ")
+        self.assertEqual(cur_bj[1], "999.10")
+
+    def test_version_error_codes_http(self) -> None:
+        c = _client()
+        self._seed(c)
+        # 从未存在 -> 404
+        r1 = c.post("/query", json={"measures": ["cnt"], "at_version": 9999})
+        self.assertEqual(r1.status_code, 404)
+        self.assertEqual(r1.json()["error"]["code"], "version_never_existed")
+        # 超范围 -> 400
+        r0 = c.post("/query", json={"measures": ["cnt"], "at_version": 0})
+        self.assertEqual(r0.status_code, 400)
+        self.assertEqual(r0.json()["error"]["code"], "version_out_of_range")
+        self.log_judgement("HTTP 版本不存在/超范围",
+                           "404 version_never_existed / 400 version_out_of_range",
+                           f"{r1.status_code}/{r0.status_code}")
+
+    def test_version_evicted_http_410(self) -> None:
+        from fastapi.testclient import TestClient
+
+        c = TestClient(create_app(MetricLayer(max_history=1)))
+        c.post("/datasets/t", json={"primary_key": ["id"],
+                                    "records": [{"id": 1, "v": "1"}]})
+        c.post("/measures", json={"name": "c", "dataset": "t", "agg": "count"})
+        c.post("/measures", json={"name": "s", "dataset": "t",
+                                  "agg": "sum", "field": "v"})
+        c.post("/dimensions", json={"name": "g", "dataset": "t", "field": "v"})
+        # 容量 1：最早的版本已淘汰
+        r = c.post("/query", json={"measures": ["c"], "at_version": 1})
+        self.log_judgement("HTTP 回查已淘汰版本",
+                           "410 version_evicted，不回退当前",
+                           f"{r.status_code} {r.json()['error']['code']}")
+        self.assertEqual(r.status_code, 410)
+        self.assertEqual(r.json()["error"]["code"], "version_evicted")
+
+    def test_set_history_limit_http(self) -> None:
+        c = _client()
+        self._seed(c)
+        r = c.post("/history/limit", json={"max_history": 0})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["max_history"], 0)
+        listing = c.get("/versions").json()
+        self.assertEqual(listing["history_versions"], [])
+        # 非法值 -> 400
+        bad = c.post("/history/limit", json={"max_history": -1})
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(bad.json()["error"]["code"], "version_out_of_range")
+        self.log_judgement("HTTP 调整保留容量", "成功置 0；非法值 400", "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

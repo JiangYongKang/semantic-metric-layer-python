@@ -98,17 +98,82 @@ many→one/one_to_one 路径可达的数据集，违反 → `query_error`。
 “在明细行上计算（computed on detail rows）”。血缘与结果在引擎内同一次计算产出，
 不存在事后补造或错位的可能。
 
-## 5. 结构变更与版本可复现
+## 5. 结构变更、安全发布与版本可复现
+
+### 5.1 版本号与结构变更规则
 
 - 数据集每次成功注册/更新、口径或关联每次成功登记都会让**模型版本**单调 +1；
-  每个数据集自身也有从 1 开始的数据版本。
+  每个数据集自身也有从 1 开始的数据版本。版本号从 1 起连续，失败绝不升版。
 - 内容更新只允许「列集合不变」或「仅新增列」；
   **删列/改名 → `source_update_rejected`（HTTP 409）**，杜绝查询静默错列。
   新增列对旧数据以 `NULL` 补且 `nullable=true`（缺省语义稳定、显式）。
 - 旧列类型漂移（如 decimal→text）→ `type_conflict`。
 - 查询结果携带 `model_version`；持有旧快照的查询永远得到旧结果，
   历史结果可用版本号区分并复现。
-- 任何**失败的**注册/更新都不升版、不清缓存、不改变已发布状态。
+
+### 5.2 失败发布不污染（原子提交）
+
+每次变更都按「**克隆候选态 → 应用变更 → 在候选态上整体重建模型并全量校验
+→ 全部通过才原子替换当前指针**」执行，全流程持同一把锁。整体校验覆盖：
+
+- 数据集结构兼容（列集合、类型）与**主键仍唯一非空**；
+- **所有既有 `many_to_one` / `one_to_one` 关联的 one 侧键仍唯一非空**
+  （哪怕该数据集自身没声明主键，只要数据更新会让某个关联键重复/为空，整次更新拒绝，
+  错误码 `non_unique_key`）；
+- **所有既有口径仍可解析**（字段未被删除/改名、字段类型仍数值兼容等）；
+- 新增口径/关联自身的命名冲突、字段存在性、关联歧义等全部规则。
+
+只要其中任何一项不满足，本次更新就**整体拒绝**，可观察结果是更新前后完全一致：
+
+| 可观察项 | 失败发布后 |
+| --- | --- |
+| `model_version()` | 不变（绝不出现「版本前进、数据仍旧」） |
+| 当前数据 / 口径 / 关联 | 全部是更新前内容（绝不出现「数据已变、版本缓存仍旧」） |
+| 查询缓存 | 不清空、不污染，原有缓存条目继续命中 |
+| 当前查询结果 | 与更新前逐字节一致 |
+| 后续定义口径/关联 | 立即恢复正常，不受失败尝试影响 |
+| 历史版本栈 | 不写入任何条目 |
+
+候选态是与在线态**不共享可变容器**的克隆；失败时直接丢弃，在线指针从不移动，
+因此不存在半更新状态。
+
+### 5.3 按历史版本回查
+
+查询时显式传 `at_version=<版本号>`，即在**当时的完整不可变快照**
+（当时的数据、口径册、关联图与列级血缘）上，用**同一套**维度/指标/过滤/资源预算
+语义执行：
+
+```python
+past = layer.query(q, at_version=v)        # Python
+POST /query  {"measures": ["cnt"], "at_version": 3}   # HTTP
+```
+
+- 回查结果的 `model_version` 就是所请求的版本；之后才定义的口径在旧版本上仍报
+  `caliber_not_found`，绝不会拿当前口径顶替；之后才改变的数据也不会渗入。
+- 回查结果与列级血缘来自当时的同一次计算，和「当时当次」查询逐字节一致。
+- **历史回查不读取、也不写入当前查询缓存**，因此不改变当前版本的缓存命中率与
+  查询结果；显式指定「当前版本号」与不指定等价（算当前查询、走当前缓存）。
+- 回查同样受 `ResourceBudget` 约束（维度、指标、过滤、预算语义完全一致）。
+
+### 5.4 历史版本保留与容量边界
+
+- `MetricLayer(max_history=N)`：最多保留 **N 个历史版本**（默认 10）。
+  当前最新版本永远保留；`N=0` 表示不保留任何历史版本（上一版在下次发布时即淘汰）。
+- 每次成功发布后，被取代的旧版本压入历史栈；超过容量时按 **FIFO（版本最旧者先淘汰）**
+  稳定淘汰——同样的变更序列在任何机器上淘汰结果一致。
+- 运行期可用 `set_history_limit(N)` 调整容量，调小会**立即**按 FIFO 淘汰多余版本，
+  返回被淘汰的版本号；调大不会恢复已淘汰版本。
+- 缺省（不传 `at_version`）永远查当前最新版本。三种「查不到」必须分别可判别，
+  系统不会用当前版本回退冒充：
+
+| 情形 | 错误码（HTTP） | 判定 |
+| --- | --- | --- |
+| 版本号从未存在（大于当前版本） | `version_never_existed`（404） | `at_version > current` |
+| 曾发布但已被淘汰 | `version_evicted`（410） | `1 <= at_version < current` 且不在保留栈；details 含 `retained_versions` / `max_history` |
+| 超出可回查范围（非正整数等） | `version_out_of_range`（400） | `at_version < 1` 或非整数 |
+
+- 辅助接口：`history_versions()` 返回仍可回查的历史版本号（升序，不含当前）；
+  HTTP `GET /versions` 返回当前版本、历史清单、最旧可用版本与保留容量。
 
 ## 6. 资源上限与超限处置
 
@@ -128,9 +193,13 @@ many→one/one_to_one 路径可达的数据集，违反 → `query_error`。
 ## 7. 并发一致性
 
 - 全局可重入锁保护注册/更新/查询；模型以**不可变快照**发布，查询只持快照。
-- 更新是「构建新快照 → 原子替换指针」，查询不可能观察到半更新状态。
-- 查询缓存按 `(查询形状, 预算)` 键控，且任何模型升版都**整体清空缓存**，
-  保证缓存永不落后于当前数据/口径；失败查询不写缓存。
+- 更新是「克隆候选态 → 全量校验 → 原子替换指针」，提交点只替换不可变引用，
+  查询不可能观察到半更新状态；任何一次并发读取看到的都是某个**完整版本**。
+- 失败发布不移动当前指针、不入历史、不清缓存；并发读永远看不到失败尝试。
+- 查询缓存按 `(查询形状, 预算)` 键控，且任何**成功**发布都**整体清空缓存**，
+  保证缓存永不落后于当前数据/口径；失败查询不写缓存；历史回查不触碰当前缓存。
+- 历史回查与当前查询、与发布并发时，要么读到一个保留中的完整历史快照，
+  要么得到明确的 `version_evicted`，不会读到当前数据顶替的结果。
 
 ## 8. HTTP 接口速览
 
@@ -145,8 +214,21 @@ POST /ratios                                 # {"name","dataset","numerator","de
 POST /relations                              # {"name","left_dataset","left_keys",
                                              #  "right_dataset","right_keys","cardinality"}
 POST /query                                  # {"dimensions":[],"measures":[],
-                                             #  "filters":[...],"budget":{...}}
+                                             #  "filters":[...],"budget":{...},
+                                             #  "at_version":3?}  # 省略=当前
+GET  /versions                               # 当前/历史版本清单与保留容量
+POST /history/limit                          # {"max_history": N} 调整保留容量
 GET  /cache/size ; POST /cache/clear
+```
+
+`/query` 响应在回查历史时额外给出 `"historical": true`、`"current_version"`，
+便于核对所回查版本与当前版本；`/versions` 形如：
+
+```json
+{"current_version": 9,
+ "history_versions": [1, 2, 3, 4, 5, 6, 7, 8],
+ "oldest_available_version": 1,
+ "max_history": 10}
 ```
 
 错误响应统一为：
@@ -170,10 +252,21 @@ uv run python -m unittest discover -s tests -v
 uv run python -m unittest tests.test_engine -v       # 结果语义与精度
 uv run python -m unittest tests.test_concurrency -v  # 资源上限与并发
 uv run python -m unittest tests.test_relations -v    # 关联歧义与膨胀
+uv run python -m unittest tests.test_history -v      # 历史回查/淘汰/原子发布/并发
+uv run python -m unittest tests.test_service -v      # HTTP（含历史回查与错误码）
 
-# 端到端可运行示例（建数、定义口径、查询、打印血缘）
+# 端到端可运行示例（建数、定义口径、查询、血缘、历史版本回查）
 uv run python examples/basic_usage.py
 ```
+
+历史回查/安全发布专项覆盖（`tests/test_history.py`）：
+
+- 回查结果与列级血缘和当时当次逐字节一致、当前数据不顶替、之后定义的口径不渗入；
+- 回查支持同样的维度/过滤/预算，且不影响当前版本缓存命中与结果；
+- FIFO 保留/淘汰边界、调小容量立即淘汰、`max_history=0`；
+- `version_never_existed` / `version_evicted` / `version_out_of_range` 三类错误可区分；
+- 关联键不唯一、删列/类型漂移、口径失效等失败发布后版本/缓存/数据零污染；
+- 并发更新与当前/历史读取只看到完整版本；原有聚合、关联歧义、精度、资源上限用例不回归。
 
 单测基类 `tests._support.LoggingTestCase` 会为关键判定打印
 `[输入] / [判定依据] / [实际]`，便于追溯每个错误归类与边界结果。
@@ -184,4 +277,16 @@ uv run python examples/basic_usage.py
 `dataset_already_exists` · `dataset_not_found` · `source_update_rejected` ·
 `non_unique_key` · `ambiguous_join` · `relation_error` ·
 `caliber_conflict` · `caliber_not_found` · `invalid_caliber` ·
-`query_error` · `resource_limit` · `concurrency_conflict`
+`query_error` · `resource_limit` · `concurrency_conflict` ·
+`version_never_existed` · `version_evicted` · `version_out_of_range`
+
+## 10. 兼容范围
+
+- 历史回查只在**进程内、同一 `MetricLayer` 实例**上保留内存快照；进程重启不恢复历史
+  （当前版本同样是内存态）。本次不引入持久化，也不跨进程共享版本。
+- `MetricLayer()` 与 `create_app()` 的既有调用零改动：`max_history` 为带默认值的
+  关键字参数（默认 10）；`query()` 仅新增可选关键字 `at_version`，缺省行为不变。
+- 既有查询结果、血缘结构、错误码、缓存与资源上限语义保持不变；
+  唯一行为强化点：数据更新若会破坏**既有**关联键唯一性或既有口径，从「可能带病提交」
+  收敛为「整次拒绝」（此前这类破坏本就没有合法语义）。
+- 保留容量只约束历史版本数，不约束当前版本；淘汰不删除任何当前数据。

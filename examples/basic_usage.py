@@ -77,6 +77,30 @@ def main() -> None:
     for row in result2.rows:
         print("by tier row  =", tuple(format(v, "f") if isinstance(v, Decimal) else v for v in row))
 
+    # 6) 历史版本回查：记录当前版本 -> 改变数据 -> 回查旧版本
+    #    旧版本返回当时的数据/口径/关联/血缘，绝不被当前数据顶替。
+    past_version = layer.model_version()
+    past_rows = result.rows
+    layer.replace_dataset_data(
+        "orders",
+        [
+            {"oid": 1, "cid": 10, "region": "east", "amount": Decimal("999.00"), "qty": 2},
+            {"oid": 2, "cid": 20, "region": "west", "amount": Decimal("200.30"), "qty": 3},
+        ],
+    )
+    back = layer.query(
+        Query(
+            dimensions=("region",),
+            measures=("total_amount", "orders_cnt", "avg_amount", "avg_order_value"),
+            filters=(Filter("region", ("east",), negate=True),),
+        ),
+        at_version=past_version,
+    )
+    print("history ver  =", back.model_version, "current =", layer.model_version())
+    print("history rows =", back.rows)
+    print("history ==当时当次:", back.rows == past_rows)
+    print("retained     =", layer.history_versions())
+
 
 if __name__ == "__main__":
     main()
