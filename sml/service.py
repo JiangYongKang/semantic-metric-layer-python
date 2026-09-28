@@ -4,11 +4,18 @@
 
 - ``GET  /health``                    健康检查
 - ``GET  /meta``                      当前模型版本、数据集/关联/指标清单
+- ``GET  /versions``                  当前/可回查历史版本、保留上限
+- ``POST /versions/retention``        调整历史保留上限（立即 FIFO 淘汰）
 - ``POST /datasets/{name}``           注册数据集（records + 可选 primary_key）
-- ``PUT  /datasets/{name}/data``      更新数据内容（删列/改名会被拒绝）
+- ``PUT  /datasets/{name}/data``      更新数据内容（候选预检，失配整次拒绝）
 - ``POST /dimensions`` / ``/measures`` / ``/ratios`` / ``/relations`` 定义口径
-- ``POST /query``                     指标查询（返回行 + 列级血缘 + 版本）
+- ``POST /query``                     指标查询（可带 ``at_version`` 历史回查；
+  返回行 + 列级血缘 + 版本；历史结果额外标 ``historical``/``current_version``）
 - ``GET  /cache/size`` ``POST /cache/clear``
+
+版本回查失败按可区分码映射：``version_not_found`` -> 404，
+``version_evicted`` / ``version_out_of_range`` -> 410，
+``invalid_retention`` -> 422。
 
 所有 :class:`~sml.errors.SMLError` 统一映射为 HTTP 4xx，响应体携带稳定
 错误码 ``error.code`` 与结构化 ``details``；Decimal 序列化为字符串，
@@ -58,6 +65,10 @@ _STATUS_MAP = {
     "query_error": 400,
     "resource_limit": 429,
     "concurrency_conflict": 409,
+    "version_not_found": 404,
+    "version_evicted": 410,
+    "version_out_of_range": 410,
+    "invalid_retention": 422,
 }
 
 
@@ -73,8 +84,10 @@ def _jsonable(value: object) -> object:
     return json.loads(json.dumps(value, cls=_JSONEncoder))
 
 
-def create_app(layer: MetricLayer | None = None) -> FastAPI:
-    layer = layer or MetricLayer()
+def create_app(
+    layer: MetricLayer | None = None, *, history_retention: int | None = None
+) -> FastAPI:
+    layer = layer or MetricLayer(history_retention=history_retention)
     app = FastAPI(title="Local Semantic Metric Layer", version="0.1.0")
     app.state.layer = layer
 
@@ -103,6 +116,28 @@ def create_app(layer: MetricLayer | None = None) -> FastAPI:
             "relations": layer.list_relations(),
             "metrics": layer.list_metrics(),
             "cache_size": layer.cache_size(),
+        }
+
+    @app.get("/versions")
+    def versions() -> dict:
+        """历史版本可观察信息：当前版本、可回查版本、保留上限。"""
+        retained = layer.retained_versions()
+        return {
+            "current_version": layer.model_version() or 0,
+            "retained_versions": retained,
+            "oldest_retained_version": retained[0] if retained else None,
+            "history_retention": layer.history_retention(),
+        }
+
+    @app.post("/versions/retention")
+    async def set_retention(request: Request) -> dict:
+        b = await request.json()
+        evicted = layer.set_history_retention(b.get("retention"))
+        return {
+            "ok": True,
+            "history_retention": layer.history_retention(),
+            "evicted_versions": evicted,
+            "retained_versions": layer.retained_versions(),
         }
 
     @app.post("/datasets/{name}")
@@ -196,12 +231,21 @@ def create_app(layer: MetricLayer | None = None) -> FastAPI:
             max_bytes=int(bb.get("max_bytes", 256 * 1024 * 1024)),
             on_overflow=LimitAction(bb.get("on_overflow", "reject")),
         )
-        result = layer.query(q, budget=budget, use_cache=bool(b.get("use_cache", True)))
+        result = layer.query(
+            q,
+            budget=budget,
+            use_cache=bool(b.get("use_cache", True)),
+            at_version=b.get("at_version"),
+        )
         return {
             "columns": list(result.columns),
             "rows": [list(_jsonable_cell(v) for v in row) for row in result.rows],
             "lineage": result.lineage.to_dict(),
             "model_version": result.model_version,
+            "current_version": layer.model_version(),
+            "historical": bool(
+                (result.resource_stats or {}).get("historical", False)
+            ),
             "truncated": result.truncated,
             "resource_stats": result.resource_stats,
         }

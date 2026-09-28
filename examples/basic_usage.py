@@ -77,6 +77,33 @@ def main() -> None:
     for row in result2.rows:
         print("by tier row  =", tuple(format(v, "f") if isinstance(v, Decimal) else v for v in row))
 
+    # 6) 历史版本回查：记录当前版本，改数据后回看，结果与当时逐字节一致
+    version_then = result.model_version
+    layer.replace_dataset_data(
+        "orders",
+        [
+            {"oid": 1, "cid": 10, "region": "east", "amount": Decimal("999.00"), "qty": 2},
+            {"oid": 2, "cid": 10, "region": "east", "amount": Decimal("1.00"), "qty": None},
+            {"oid": 3, "cid": 20, "region": "west", "amount": Decimal("1.00"), "qty": 3},
+            {"oid": 4, "cid": 99, "region": None, "amount": None, "qty": 5},
+        ],
+    )
+    replay = layer.query(
+        Query(
+            dimensions=("region",),
+            measures=("total_amount", "orders_cnt", "avg_amount", "avg_order_value"),
+            filters=(Filter("region", ("east",), negate=True),),
+        ),
+        at_version=version_then,
+    )
+    print("replay ver   =", replay.model_version,
+          "current =", layer.model_version(),
+          "historical =", replay.resource_stats.get("historical"))
+    for row in replay.rows:
+        print("replay row   =", tuple(format(v, "f") if isinstance(v, Decimal) else v for v in row))
+    print("replay == 当时结果:", replay.rows == result.rows,
+          "血缘一致:", replay.lineage.to_dict() == result.lineage.to_dict())
+
 
 if __name__ == "__main__":
     main()

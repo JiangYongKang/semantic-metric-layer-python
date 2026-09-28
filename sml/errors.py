@@ -155,3 +155,40 @@ class ConcurrencyError(SMLError):
     """并发冲突（如版本已过期）。"""
 
     code = "concurrency_conflict"
+
+
+class VersionError(SMLError):
+    """历史版本回查相关错误的基类。"""
+
+    code = "version_error"
+
+
+class VersionNotFoundError(VersionError):
+    """指定的版本号从未存在（如大于当前版本、非正数）。
+
+    与「曾经存在但已被淘汰」严格区分：调用方绝不能用当前版本回退冒充。
+    """
+
+    code = "version_not_found"
+
+
+class VersionEvictedError(VersionError):
+    """版本曾经存在，但因超过历史保留上限被淘汰。
+
+    details 携带 ``requested`` / ``oldest_available`` / ``retention``，
+    便于调用方区分「从未存在」与「曾经存在但已不可回查」。
+    """
+
+    code = "version_evicted"
+
+
+class VersionOutOfRangeError(VersionError):
+    """版本号早于可回查范围（从未被保留进历史，而非保留后被淘汰）。"""
+
+    code = "version_out_of_range"
+
+
+class RetentionConfigError(SMLError):
+    """历史版本保留配置非法（如负数）。"""
+
+    code = "invalid_retention"

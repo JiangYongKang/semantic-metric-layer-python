@@ -150,5 +150,75 @@ class ServiceTest(LoggingTestCase):
         self.assertTrue(body["truncated"])
 
 
+class ServiceVersionTest(LoggingTestCase):
+    def _client_with_history(self) -> TestClient:
+        layer = MetricLayer(history_retention=1)
+        return TestClient(create_app(layer))
+
+    def test_versions_endpoint_and_historical_query(self) -> None:
+        c = self._client_with_history()
+        r = c.post("/datasets/t", json={
+            "primary_key": ["id"],
+            "records": [{"id": 1, "v": 1}],
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        c.post("/measures", json={"name": "c", "dataset": "t", "agg": "count"})
+        old = c.get("/meta").json()["model_version"]
+        c.put("/datasets/t/data", json={
+            "records": [{"id": 1, "v": 1}, {"id": 2, "v": 2}]
+        })
+        info = c.get("/versions").json()
+        self.log_judgement("GET /versions", "当前=旧+1、历史含旧版、retention=1", info)
+        self.assertEqual(info["current_version"], old + 1)
+        self.assertEqual(info["retained_versions"], [old])
+        self.assertEqual(info["oldest_retained_version"], old)
+        self.assertEqual(info["history_retention"], 1)
+
+        cur = c.post("/query", json={"measures": ["c"]}).json()
+        hist = c.post("/query", json={"measures": ["c"], "at_version": old}).json()
+        self.assertEqual(cur["rows"], [[2]])
+        self.assertEqual(hist["rows"], [[1]])
+        self.assertTrue(hist["historical"])
+        self.assertEqual(hist["model_version"], old)
+        self.assertEqual(hist["current_version"], old + 1)
+
+    def test_version_error_http_status_mapping(self) -> None:
+        c = self._client_with_history()
+        c.post("/datasets/t", json={"records": [{"id": 1, "v": 1}]})
+        c.post("/measures", json={"name": "c", "dataset": "t", "agg": "count"})
+        # 再发一次更新，把第一版挤出 retention=1 的窗口
+        c.put("/datasets/t/data", json={
+            "records": [{"id": 1, "v": 1}, {"id": 2, "v": 2}]
+        })
+        c.put("/datasets/t/data", json={
+            "records": [{"id": 1, "v": 1}, {"id": 2, "v": 2}, {"id": 3, "v": 3}]
+        })
+        ev = c.post("/query", json={"measures": ["c"], "at_version": 1})
+        self.log_judgement("HTTP 回查已淘汰版本", "410 version_evicted",
+                           f"{ev.status_code} {ev.json()['error']['code']}")
+        self.assertEqual(ev.status_code, 410)
+        self.assertEqual(ev.json()["error"]["code"], "version_evicted")
+        nf = c.post("/query", json={"measures": ["c"], "at_version": 999})
+        self.assertEqual(nf.status_code, 404)
+        self.assertEqual(nf.json()["error"]["code"], "version_not_found")
+
+    def test_set_retention_endpoint(self) -> None:
+        c = self._client_with_history()
+        c.post("/datasets/t", json={"records": [{"id": 1, "v": 1}]})
+        c.post("/measures", json={"name": "c", "dataset": "t", "agg": "count"})
+        c.put("/datasets/t/data", json={
+            "records": [{"id": 1, "v": 1}, {"id": 2, "v": 2}]
+        })
+        r = c.post("/versions/retention", json={"retention": 0})
+        body = r.json()
+        self.log_judgement("retention 调为 0", "返回被淘汰版本且留存为空", body)
+        self.assertEqual(body["history_retention"], 0)
+        self.assertEqual(body["retained_versions"], [])
+        self.assertTrue(body["evicted_versions"])
+        bad = c.post("/versions/retention", json={"retention": -1})
+        self.assertEqual(bad.status_code, 422)
+        self.assertEqual(bad.json()["error"]["code"], "invalid_retention")
+
+
 if __name__ == "__main__":
     unittest.main()
