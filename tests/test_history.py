@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import threading
+from decimal import Decimal
 
-from sml.caliber import AggKind, DimensionSpec, MeasureSpec
+from sml.caliber import AggKind, DimensionSpec, MeasureSpec, RatioSpec
 from sml.engine import Filter, Query
 from sml.errors import (
+    CaliberNotFoundError,
     NonUniqueKeyError,
     RetentionConfigError,
     SourceUpdateError,
@@ -253,6 +255,145 @@ class HistoricalReplayTest(LoggingTestCase):
             layer.query(Query(measures=("cnt",)), at_version=old)
         self.log_judgement("曾经可回查后被缩容淘汰，再调大上限", "仍为 evicted，不复活",
                            "version_evicted")
+
+
+class HistoricalCaliberIsolationTest(LoggingTestCase):
+    """回查历史版本时，只能使用该版本当时已存在的口径/关联/数据：
+
+    在回看版本之后才定义的指标、维度、比率，回查必须明确报
+    ``caliber_not_found``（该版本上这个口径还不存在），绝不能用当前
+    已定义的同名口径算出结果顶替；之后才建立的关联同理（路径不存在）。
+    """
+
+    def _layer_with_old_version(self) -> tuple[MetricLayer, int]:
+        layer = MetricLayer()  # retention=None，保留全部历史
+        _seed_star(layer)
+        return layer, layer.model_version()
+
+    def test_measure_defined_after_target_version_not_found(self) -> None:
+        layer, v_old = self._layer_with_old_version()
+        layer.add_measure(MeasureSpec("mx", "orders", AggKind.MAX, "v"))
+        # 当前版本可以正常查询 mx
+        self.assertEqual(layer.query(Query(measures=("mx",))).rows, ((2,),))
+        # 回查 mx 定义之前的版本：必须报不存在，而不是用当前口径顶替
+        with self.assertRaises(CaliberNotFoundError) as cm:
+            layer.query(Query(measures=("mx",)), at_version=v_old)
+        self.log_judgement(
+            f"指标 mx 在 v{v_old} 之后才定义",
+            "回查报 caliber_not_found，绝不拿当前口径顶替",
+            f"{cm.exception.code}: {cm.exception}",
+        )
+        self.assertErrorCode(cm, "caliber_not_found")
+        self.assertEqual(cm.exception.details["caliber"], "mx")
+
+    def test_dimension_defined_after_target_version_not_found(self) -> None:
+        layer, v_old = self._layer_with_old_version()
+        layer.add_dimension(DimensionSpec("cid", "customers", "cid"))
+        cur = layer.query(Query(dimensions=("cid",), measures=("cnt",)))
+        self.assertEqual(len(cur.rows), 2)
+        with self.assertRaises(CaliberNotFoundError) as cm:
+            layer.query(Query(dimensions=("cid",), measures=("cnt",)),
+                        at_version=v_old)
+        self.log_judgement(
+            f"维度 cid 在 v{v_old} 之后才定义",
+            "回查报 caliber_not_found",
+            f"{cm.exception.code}: {cm.exception}",
+        )
+        self.assertErrorCode(cm, "caliber_not_found")
+        self.assertEqual(cm.exception.details["kind"], "dimension")
+
+    def test_ratio_defined_after_target_version_not_found(self) -> None:
+        layer, v_old = self._layer_with_old_version()
+        layer.add_ratio(RatioSpec("avg_v", "orders", "s", "cnt"))
+        self.assertEqual(
+            layer.query(Query(measures=("avg_v",))).rows,
+            ((Decimal("1.5000000000"),),),
+        )
+        with self.assertRaises(CaliberNotFoundError) as cm:
+            layer.query(Query(measures=("avg_v",)), at_version=v_old)
+        self.log_judgement(
+            f"比率 avg_v 在 v{v_old} 之后才定义",
+            "回查报 caliber_not_found",
+            cm.exception.code,
+        )
+        self.assertErrorCode(cm, "caliber_not_found")
+
+    def test_relation_defined_after_target_version_no_path(self) -> None:
+        # 先只建数据集与口径（维度在 customers 上），关联之后才建立
+        layer = MetricLayer()
+        layer.register_dataset(
+            "orders",
+            [{"oid": 1, "cid": 10, "v": 1}, {"oid": 2, "cid": 20, "v": 2}],
+            primary_key=("oid",),
+        )
+        layer.register_dataset(
+            "customers",
+            [{"cid": 10, "city": "EAST"}, {"cid": 20, "city": "WEST"}],
+        )
+        layer.add_dimension(DimensionSpec("city", "customers", "city"))
+        layer.add_measure(MeasureSpec("cnt", "orders", AggKind.COUNT))
+        v_old = layer.model_version()
+        layer.add_relation(
+            Relation("o_c", "orders", ("cid",), "customers", ("cid",),
+                     Cardinality.MANY_TO_ONE)
+        )
+        # 当前版本可跨表查询
+        self.assertEqual(
+            layer.query(Query(dimensions=("city",), measures=("cnt",))).rows,
+            (("EAST", 1), ("WEST", 1)),
+        )
+        # 回查关联建立之前的版本：路径不存在，必须明确拒绝而非用当前关联
+        from sml.errors import AmbiguousJoinError
+
+        with self.assertRaises(AmbiguousJoinError) as cm:
+            layer.query(Query(dimensions=("city",), measures=("cnt",)),
+                        at_version=v_old)
+        self.log_judgement(
+            f"关联 o_c 在 v{v_old} 之后才建立",
+            "回查报 ambiguous_join(no_path)，不拿当前关联顶替",
+            f"{cm.exception.code}: {cm.exception.details.get('reason')}",
+        )
+        self.assertErrorCode(cm, "ambiguous_join")
+        self.assertEqual(cm.exception.details["reason"], "no_path")
+
+    def test_failed_historical_query_does_not_affect_current(self) -> None:
+        layer, v_old = self._layer_with_old_version()
+        layer.add_measure(MeasureSpec("mx", "orders", AggKind.MAX, "v"))
+        q_cur = Query(measures=("cnt",))
+        first = layer.query(q_cur)
+        cache_size = layer.cache_size()
+        # 历史回查因口径不存在而失败：当前缓存与当前结果不受影响
+        with self.assertRaises(CaliberNotFoundError):
+            layer.query(Query(measures=("mx",)), at_version=v_old)
+        again = layer.query(q_cur)
+        self.log_judgement(
+            "历史回查报 caliber_not_found 之后",
+            "当前缓存大小不变、当前查询仍命中、结果不变",
+            f"cache {cache_size}->{layer.cache_size()}, "
+            f"hit={again.resource_stats.get('cache_hit')}",
+        )
+        self.assertEqual(layer.cache_size(), cache_size)
+        self.assertTrue(again.resource_stats.get("cache_hit"))
+        self.assertEqual(again.rows, first.rows)
+
+    def test_same_name_caliber_never_silently_substituted(self) -> None:
+        """同名口径在不同版本只能有一个定义（重定义会被 caliber_conflict 拒绝），
+        因此历史回查看到的口径定义与当时完全一致，不存在'当前口径顶替'。"""
+        layer, v_old = self._layer_with_old_version()
+        # 试图用同名口径覆盖（不同聚合）：必须被拒绝，历史与当前都保持原定义
+        from sml.errors import CaliberConflictError
+
+        with self.assertRaises(CaliberConflictError):
+            layer.add_measure(MeasureSpec("s", "orders", AggKind.MAX, "v"))
+        hist = layer.query(Query(measures=("s",)), at_version=v_old)
+        cur = layer.query(Query(measures=("s",)))
+        self.log_judgement(
+            "同名口径重定义被拒后回查",
+            "历史与当前都仍是原 sum 定义（3），无任何顶替",
+            f"hist={hist.rows}, cur={cur.rows}",
+        )
+        self.assertEqual(hist.rows, ((3,),))
+        self.assertEqual(cur.rows, ((3,),))
 
 
 if __name__ == "__main__":

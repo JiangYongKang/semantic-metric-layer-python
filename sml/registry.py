@@ -16,10 +16,12 @@
   ``query(..., at_version=v)`` 在**当时的**快照上重放，支持与当前完全
   相同的维度/指标/过滤/资源预算语义，结果与当时当次一致；历史查询
   不读写当前版本缓存，因而不会改变当前版本的缓存命中与查询结果。
-- 数据更新（``replace_dataset_data``）采用「候选副本全量预检 → 原子提交」：
-  在与当前同构的候选注册中心上执行替换并整体重建模型，任何关联键不再
-  唯一、结构不兼容或口径/查询路径失效都会在提交前暴露；预检失败时
-  当前版本号、当前模型、缓存以及后续登记行为与更新前完全一致。
+- **所有**变更类型（数据集注册/数据更新/口径定义/关联定义）统一采用
+  「候选副本全量预检 → 原子提交」：先在与当前已发布模型同构的隔离副本上
+  应用变更并整体重建模型——结构推断、关联键唯一性、口径合法性、查询路径
+  全部在副本上重新校验；任一步抛错都发生在副本上，当前注册中心、版本号、
+  当前模型、缓存以及历史档案与变更前完全一致（要么整体成功、要么整体不变），
+  之后继续正常登记或更新不受影响。
 """
 
 from __future__ import annotations
@@ -61,35 +63,38 @@ class MetricLayer:
         self, name: str, records: list[dict], *, primary_key: tuple[str, ...] = ()
     ):
         with self._lock:
+            candidate = self._build_candidate(
+                lambda reg, _book, _graph: reg.register(
+                    name, records, primary_key=primary_key
+                )
+            )
+            # 预检全部通过：对当前注册中心执行同一变更（同输入、已验证，必然
+            # 成功），再提交已验证的候选模型。
             ds = self._datasets.register(name, records, primary_key=primary_key)
-            self._bump()
+            self._commit(candidate)
             return ds
 
     def replace_dataset_data(self, name: str, records: list[dict]):
         with self._lock:
-            # 安全发布：先在与当前同构的「候选副本」上执行替换并整体重建
-            # 模型（关联键唯一、结构兼容、口径与查询路径全部复验）。
-            # 任一步抛错都发生在副本上，当前注册中心/版本/缓存均不触碰。
-            candidate_model = self._build_candidate_after_data_replace(name, records)
-            # 预检全部通过：对当前注册中心执行同一变更（与副本同输入，
-            # 且副本已验证通过，故必然成功），再提交已验证的候选模型。
-            self._datasets.replace_data(name, records)
-            self._commit(candidate_model)
-            return candidate_model.datasets[name]
+            candidate = self._build_candidate(
+                lambda reg, _book, _graph: reg.replace_data(name, records)
+            )
+            ds = self._datasets.replace_data(name, records)
+            self._commit(candidate)
+            return ds
 
-    def _build_candidate_after_data_replace(
-        self, name: str, records: list[dict]
-    ) -> SemanticModel:
-        """在隔离副本上执行数据替换并整体构建候选模型。
+    def _build_candidate(self, mutate) -> SemanticModel:
+        """在隔离副本上应用变更并整体构建候选模型。
 
-        副本是当前已发布模型的同构再构建，因此已有的关联唯一性、口径
-        有效性都会在新数据上重新检查；任何拒绝都在此处、提交之前发生。
+        ``mutate(registry, book, graph)`` 在副本上执行具体变更（注册/替换数据、
+        登记口径、登记关联）。副本是当前已发布模型的同构再构建，因此既有的
+        关联唯一性、口径有效性都会与本次变更一起重新校验；任何拒绝都在此处、
+        提交之前发生，当前注册中心/版本/缓存/历史档案均不被触碰。
         """
         current = self._current_model_locked()
         frozen = dict(current.datasets)  # Dataset 不可变
         candidate_registry = DatasetRegistry()
         candidate_registry._datasets = frozen
-        candidate_registry.replace_data(name, records)  # 结构/主键复验
         candidate_book = CaliberBook(candidate_registry)
         for d in self._calibers._dimensions.values():
             candidate_book.add_dimension(d)
@@ -99,8 +104,9 @@ class MetricLayer:
             candidate_book.add_ratio(r)
         candidate_graph = RelationGraph(candidate_registry)
         for rel in self._relations._relations.values():
-            # 关联键在新数据上的唯一/非空、列存在性在此复验
+            # 关联键在（可能已变更的）新数据上的唯一/非空、列存在性在此复验
             candidate_graph.add(rel)
+        mutate(candidate_registry, candidate_book, candidate_graph)
         return build_model(
             self._model_version + 1,
             candidate_registry,
@@ -113,27 +119,39 @@ class MetricLayer:
             return self._datasets.get(name).version
 
     # ------------------------------------------------------------------
-    # 口径 / 关联（每次成功登记都使模型升版）
+    # 口径 / 关联（每次成功登记都使模型升版；失败则整体不变）
     # ------------------------------------------------------------------
     def add_dimension(self, spec: DimensionSpec) -> None:
         with self._lock:
+            candidate = self._build_candidate(
+                lambda _reg, book, _graph: book.add_dimension(spec)
+            )
             self._calibers.add_dimension(spec)
-            self._bump()
+            self._commit(candidate)
 
     def add_measure(self, spec: MeasureSpec) -> None:
         with self._lock:
+            candidate = self._build_candidate(
+                lambda _reg, book, _graph: book.add_measure(spec)
+            )
             self._calibers.add_measure(spec)
-            self._bump()
+            self._commit(candidate)
 
     def add_ratio(self, spec: RatioSpec) -> None:
         with self._lock:
+            candidate = self._build_candidate(
+                lambda _reg, book, _graph: book.add_ratio(spec)
+            )
             self._calibers.add_ratio(spec)
-            self._bump()
+            self._commit(candidate)
 
     def add_relation(self, relation: Relation) -> None:
         with self._lock:
+            candidate = self._build_candidate(
+                lambda _reg, _book, graph: graph.add(relation)
+            )
             self._relations.add(relation)
-            self._bump()
+            self._commit(candidate)
 
     def model_version(self) -> int:
         with self._lock:
@@ -295,13 +313,6 @@ class MetricLayer:
                 self._model_version, self._datasets, self._calibers, self._relations
             )
         return self._model
-
-    def _bump(self) -> None:
-        """普通成功变更：构建下一版快照并提交。"""
-        new_model = build_model(
-            self._model_version + 1, self._datasets, self._calibers, self._relations
-        )
-        self._commit(new_model)
 
     def _commit(self, new_model: SemanticModel) -> None:
         """成功变更后的唯一提交点（调用方须持锁，且模型已构建成功）：
