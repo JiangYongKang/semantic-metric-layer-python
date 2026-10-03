@@ -202,6 +202,28 @@ class ServiceVersionTest(LoggingTestCase):
         self.assertEqual(nf.status_code, 404)
         self.assertEqual(nf.json()["error"]["code"], "version_not_found")
 
+    def test_historical_caliber_not_defined_http(self) -> None:
+        c = self._client_with_history()
+        c.post("/datasets/t", json={"primary_key": ["id"],
+                                    "records": [{"id": 1, "v": 1}]})
+        c.post("/measures", json={"name": "c", "dataset": "t", "agg": "count"})
+        old = c.get("/meta").json()["model_version"]
+        c.post("/measures", json={"name": "s", "dataset": "t",
+                                  "agg": "sum", "field": "v"})
+        # 指标 s 是 old 版本之后才定义的：回查必须明确拒绝，不能顶替
+        r = c.post("/query", json={"measures": ["s"], "at_version": old})
+        self.log_judgement(
+            f"HTTP 回查 v{old} 上之后才定义的指标 s",
+            "404 caliber_not_found / not_defined_at_version",
+            f"{r.status_code} {r.json()['error']['code']} "
+            f"{r.json()['error']['details'].get('reason')}",
+        )
+        self.assertEqual(r.status_code, 404)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "caliber_not_found")
+        self.assertEqual(err["details"]["reason"], "not_defined_at_version")
+        self.assertTrue(err["details"]["defined_in_current"])
+
     def test_set_retention_endpoint(self) -> None:
         c = self._client_with_history()
         c.post("/datasets/t", json={"records": [{"id": 1, "v": 1}]})

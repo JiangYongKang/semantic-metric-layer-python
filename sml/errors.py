@@ -101,7 +101,13 @@ class CaliberConflictError(CaliberError):
 
 
 class CaliberNotFoundError(CaliberError):
-    """引用了不存在的指标/维度口径。"""
+    """引用了不存在的指标/维度口径。
+
+    历史版本回查时，目标版本之后才定义的口径同样抛本错误，
+    ``details.reason = "not_defined_at_version"`` 并携带
+    ``requested_version`` / ``current_version`` / ``defined_in_current``，
+    明确表达「该版本上这个口径还不存在」，禁止用当前口径顶替。
+    """
 
     code = "caliber_not_found"
 

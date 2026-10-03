@@ -183,7 +183,10 @@ class DatasetRegistry:
                 details={"dataset": name, "existing_version": self._datasets[name].version},
             )
         schema = infer_schema(records, primary_key=primary_key, name=name)
-        ds = Dataset(name=name, schema=schema, records=tuple(records), version=1)
+        # 逐行浅拷贝：Dataset/快照不可变，调用方之后原地修改其 dict
+        # 不得污染当前模型与已归档的历史快照（值本身为不可变标量）。
+        ds = Dataset(name=name, schema=schema,
+                     records=tuple(dict(r) for r in records), version=1)
         self._datasets[name] = ds
         return ds
 
