@@ -128,6 +128,19 @@ layer.query(query, at_version=old)              # 结果与当时当次完全一
 - 返回结果的 `resource_stats.historical=true`、`cache_hit=false`；
   HTTP 响应另外携带 `current_version` 以便对账方核对。
 
+**口径隔离**：回查只使用目标版本当时已存在的口径与关联。某个指标、维度
+或比率如果是在要回看的版本**之后**才定义的，回查明确报
+`caliber_not_found`（该版本上这个口径还不存在），绝不用当前已定义的同名
+口径算出结果顶替；之后才建立的关联导致路径不存在时，回查报
+`ambiguous_join`（`reason=no_path`）。同名口径不允许重定义
+（`caliber_conflict`），因此任何版本上同名口径的定义都唯一、不可被顶替。
+
+**兼容范围**：历史回查是**同一进程、同一 `MetricLayer` 实例内**的内存快照
+机制——快照只保存在该实例内存中，进程重启后**不恢复**（重启后从版本 1 重新
+累计，旧版本号一律按 `version_not_found` 处理）；不支持跨进程、跨实例或持久化
+回查。既有调用方式（注册/定义/查询的函数签名与 HTTP 路由）完全不变，
+不开启历史回查的调用方无任何感知。
+
 ### 历史保留与淘汰边界
 
 构造层时设置除当前版本外最多保留的历史版本数（`MetricLayer(history_retention=n)`），
@@ -152,18 +165,23 @@ layer.query(query, at_version=old)              # 结果与当时当次完全一
 
 ### 失败发布不污染、历史不串档
 
-数据更新（`replace_dataset_data`）采用**「候选副本全量预检 → 原子提交」**：
-先在与当前已发布模型同构的隔离副本上替换数据并整体重建模型——关联键唯一性、
-结构兼容（删列/改名/类型漂移）、主键唯一非空、口径有效性、查询路径全部在
-新数据上重新校验；任一项不过，整次更新在提交前拒绝。
+**所有**变更类型——数据集注册（`register_dataset`）、数据更新
+（`replace_dataset_data`）、口径定义（`add_dimension` / `add_measure` /
+`add_ratio`）、关联定义（`add_relation`）——统一采用
+**「候选副本全量预检 → 原子提交」**：先在与当前已发布模型同构的隔离副本上
+应用变更并整体重建模型——结构推断、主键唯一、关联键唯一性、口径合法性、
+查询路径全部在副本上重新校验；任一项不过，整次变更在提交前拒绝。
 
-- 只要会让**关联键不再唯一/出现空键、结构不兼容、主键重复或口径失效**，
-  整次更新拒绝（`non_unique_key` / `source_update_rejected` /
-  `type_conflict` / `duplicate_primary_key` 等）；
-- 拒绝后**当前版本号、当前模型、查询结果、当前缓存**与更新前完全一致：
-  不会出现版本前进但数据仍旧、或数据已变但版本/缓存停留的混合状态；
-  失败更新也不会在历史档案中留下版本；
-- 拒绝后继续正常定义口径/关联、执行合法更新均不受影响；
+- 失败怎么判定：变更调用**抛出带稳定错误码的异常**即为失败
+  （`non_unique_key` / `source_update_rejected` / `type_conflict` /
+  `duplicate_primary_key` / `incomplete_structure` / `invalid_caliber` /
+  `caliber_conflict` / `ambiguous_join` / `dataset_already_exists` 等；
+  HTTP 层映射为 4xx + `error.code`）；
+- 失败后能看到什么：**当前版本号、当前模型、查询结果、当前缓存、已定义的
+  口径与关联、历史档案**与变更前完全一致——不会出现版本前进但数据仍旧、
+  或数据已生效但版本/缓存停留的混合状态；失败变更也不会在历史档案中留下
+  版本，版本号连续无空洞；已写入的查询缓存继续命中；
+- 失败后继续正常定义口径/关联、执行合法更新均不受影响；
 - 并发下任何读取只可能看到某一个**完整版本**（全局锁 + 快照指针原子替换 +
   查询全程只持快照），不可能观察到半更新状态；历史档案与当前缓存互不串档。
 
@@ -229,14 +247,15 @@ GET  /cache/size ; POST /cache/clear
 uv sync
 
 # 全部单测（覆盖异常数据/关联歧义/精度边界/结构变更/超限/并发/CSV/HTTP/
-#           历史回查/版本淘汰/失败发布）
+#           历史回查/版本淘汰/失败发布原子性）
 uv run python -m unittest discover -s tests -v
 
 # 只跑某个专题
-uv run python -m unittest tests.test_engine -v       # 结果语义与精度
-uv run python -m unittest tests.test_concurrency -v  # 资源上限与并发
-uv run python -m unittest tests.test_history -v      # 历史回查/淘汰/失败发布/并发完整版本
-uv run python -m unittest tests.test_relations -v    # 关联歧义与膨胀
+uv run python -m unittest tests.test_engine -v          # 结果语义与精度
+uv run python -m unittest tests.test_concurrency -v     # 资源上限与并发
+uv run python -m unittest tests.test_history -v         # 历史回查/淘汰/并发完整版本
+uv run python -m unittest tests.test_atomic_publish -v  # 各类变更失败发布的原子性
+uv run python -m unittest tests.test_relations -v       # 关联歧义与膨胀
 
 # 端到端可运行示例（建数、定义口径、查询、打印血缘）
 uv run python examples/basic_usage.py
@@ -244,8 +263,17 @@ uv run python examples/basic_usage.py
 
 `tests.test_history` 覆盖：历史回查结果与列级血缘和当时一致、历史查询支持
 同样的过滤/预算语义且不污染当前缓存、retention 的 FIFO 边界（含 0/不限/缩容）、
-三种版本不存在错误码区分、失败发布后版本/缓存/结果/后续登记完全不变、
-并发更新与读取只见完整版本、历史与当前查询并发隔离。
+三种版本不存在错误码区分、回看版本之后才定义的指标/维度/比率/关联回查明确报
+`caliber_not_found` / `ambiguous_join(no_path)`（绝不拿当前口径顶替）、
+失败发布后版本/缓存/结果/后续登记完全不变、并发更新与读取只见完整版本、
+历史与当前查询并发隔离。
+
+`tests.test_atomic_publish` 覆盖：数据更新（删列/类型漂移/关联键失唯一/空数据/
+主键重复）、口径定义（非数值聚合/字段不存在/比率基于 avg/分子未定义/重名冲突）、
+关联定义（键不唯一/同对重复/数据集不存在/键列不存在）、数据集注册（重名/空数据/
+类型冲突）四类变更失败时，版本号、缓存、当前查询结果、口径/关联/数据集清单、
+历史档案全部与变更前一致，且失败后继续定义与更新不受影响；成功/失败交替时
+版本号只随成功连续前进、无空洞，历史档案只含成功版本。
 
 单测基类 `tests._support.LoggingTestCase` 会为关键判定打印
 `[输入] / [判定依据] / [实际]`，便于追溯每个错误归类与边界结果。
